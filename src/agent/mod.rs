@@ -86,7 +86,7 @@ pub use crate::data::resources::VmResources;
 pub use crate::data::storage::HostMount;
 pub use client::{
     file_transfer_max_total, pack_export_max_total, AgentClient, ExecEvent, FileWriteMeta,
-    InteractiveInput, InteractiveOutput, PullOptions, RunConfig,
+    InteractiveInput, InteractiveOutput, PullOptions, RunConfig, WorkloadTarget,
 };
 pub use fsnotify_watch::FsNotifyWatcher;
 pub use krun::{host_layers_supported, KrunFunctions};
