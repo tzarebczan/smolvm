@@ -3055,6 +3055,23 @@ mod status_output_tests {
     }
 
     #[test]
+    fn status_json_memory_reports_guest_bytes_and_derived_use() {
+        let status = smolvm_protocol::MemoryStatus {
+            total_bytes: 2048 << 20,
+            available_bytes: 1536 << 20,
+            free_bytes: 1024 << 20,
+            cached_bytes: 256 << 20,
+            swap_total_bytes: 0,
+            swap_used_bytes: 0,
+        };
+        let json = super::memory_status_json(&status);
+        assert_eq!(json["total_bytes"], 2048u64 << 20);
+        assert_eq!(json["used_bytes"], 512u64 << 20);
+        assert_eq!(json["available_bytes"], 1536u64 << 20);
+        assert_eq!(json["cached_bytes"], 256u64 << 20);
+    }
+
+    #[test]
     fn closed_status_pipe_is_success_but_other_output_errors_are_reported() {
         let mut output = Vec::new();
         write_status_output_to(&mut output, "Machine 'x': running\n").unwrap();
@@ -3080,16 +3097,7 @@ mod status_output_tests {
 /// Silent when the machine's agent predates the request: a `status` that still
 /// reports state is more useful than one that fails over a detail.
 fn memory_usage_line(manager: &AgentManager) -> Option<String> {
-    let Ok(mut client) = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())
-    else {
-        return None;
-    };
-    let Ok(status) = client.memory_status() else {
-        return None;
-    };
-    if status.total_bytes == 0 {
-        return None;
-    }
+    let status = guest_memory_status(manager)?;
     let gib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     let percent = status.used_bytes() as f64 * 100.0 / status.total_bytes as f64;
     Some(format!(
@@ -3099,6 +3107,28 @@ fn memory_usage_line(manager: &AgentManager) -> Option<String> {
         percent,
         gib(status.available_bytes),
     ))
+}
+
+/// The guest's memory figures, or `None` when the agent cannot report them.
+fn guest_memory_status(manager: &AgentManager) -> Option<smolvm_protocol::MemoryStatus> {
+    let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket()).ok()?;
+    let status = client.memory_status().ok()?;
+    (status.total_bytes != 0).then_some(status)
+}
+
+/// The `memory` object of `machine status --json`: the same guest-reported
+/// figures the text status prints, in bytes, so a supervisor can read a
+/// machine's real use without exec'ing into it.
+fn memory_status_json(status: &smolvm_protocol::MemoryStatus) -> serde_json::Value {
+    serde_json::json!({
+        "total_bytes": status.total_bytes,
+        "available_bytes": status.available_bytes,
+        "used_bytes": status.used_bytes(),
+        "free_bytes": status.free_bytes,
+        "cached_bytes": status.cached_bytes,
+        "swap_total_bytes": status.swap_total_bytes,
+        "swap_used_bytes": status.swap_used_bytes,
+    })
 }
 
 /// Guest-side listening state of each published port of a running machine.
@@ -3201,15 +3231,18 @@ pub fn status_vm_json(name: &Option<String>) -> smolvm::Result<()> {
             ))
         }
     };
-    // Per-port guest listening state, only for a machine that is already
-    // running (status never starts one). Kept out of the shared object so
-    // `machine list --json` does not exec into every running machine.
+    // Guest memory and per-port guest listening state, only for a machine
+    // that is already running (status never starts one). Kept out of the
+    // shared object so `machine list --json` does not query every machine.
     if obj["state"] == RecordState::Running.to_string() {
         let manager = get_vm_manager(name).ok();
         if let Some(manager) = manager.filter(|m| {
             m.detach();
             m.try_connect_existing().is_some()
         }) {
+            if let Some(status) = guest_memory_status(&manager) {
+                obj["memory"] = memory_status_json(&status);
+            }
             let states = published_port_states(&label, &manager);
             if !states.is_empty() {
                 let entries: Vec<_> = states

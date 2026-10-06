@@ -635,6 +635,7 @@ OpenAPI spec: `smolvm serve openapi`
 
 ## Important Behaviors
 
+- **`machine status --json` reports guest memory.** For a running machine it adds a `memory` object (`total_bytes`, `available_bytes`, `used_bytes`, `free_bytes`, `cached_bytes`, swap) read from the guest, the same figures the text status prints.
 - **Observational commands don't stop running VMs.** `machine images`, `machine status`, `machine ls` and similar read-only commands leave a running VM in its current state. If the VM was already running before the command, it stays running after.
 - **`machine prune` works on a running VM.** Regular prune only removes unreferenced layers and is safe while containers are active. `prune --all` requires the VM to be stopped first since it deletes manifests for layers that may be in use.
 - **`machine exec` persists filesystem changes.** Package installs, config edits, and file writes inside `exec` survive across sessions. This works for both bare VMs and image-based VMs (created with `--image`).
