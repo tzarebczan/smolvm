@@ -384,6 +384,9 @@ pub enum MachineCmd {
     /// Resume saved execution in the same machine
     Resume(ResumeCmd),
 
+    /// Hand a running machine's idle memory back to the host now (balloon pulse)
+    Reclaim(ReclaimCmd),
+
     /// Delete a machine configuration
     #[command(visible_alias = "rm")]
     Delete(DeleteCmd),
@@ -464,6 +467,7 @@ impl MachineCmd {
             MachineCmd::Stop(cmd) => cmd.run(),
             MachineCmd::Pause(cmd) => cmd.run(),
             MachineCmd::Resume(cmd) => cmd.run(),
+            MachineCmd::Reclaim(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
             MachineCmd::Status(cmd) => cmd.run(),
             MachineCmd::EgressEvents(cmd) => cmd.run(),
@@ -5377,6 +5381,123 @@ impl ResumeCmd {
     pub fn run(self) -> smolvm::Result<()> {
         smolvm::embedded::EmbeddedRuntime::new()?.resume_machine_detached(&self.name)?;
         println!("Machine '{}' resumed", self.name);
+        Ok(())
+    }
+}
+
+/// Reclaim a running machine's idle memory now instead of after the idle
+/// window.
+///
+/// Pulses the balloon the way idle reclaim does after
+/// `SMOLVM_IDLE_RECLAIM` minutes: inflate so the guest evicts page cache and
+/// frees pages, which free-page reporting returns to the host, then deflate so
+/// the guest keeps its full ceiling. A supervisor calls this when it knows a
+/// machine just went idle (a browser whose session ended). Branch sources are
+/// refused for the reason idle reclaim skips them: their RAM is the stable
+/// image their branches share.
+#[derive(Args, Debug)]
+pub struct ReclaimCmd {
+    /// Machine to reclaim (default: "default")
+    #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
+    pub name: Option<String>,
+
+    /// Balloon size to inflate to, in MiB [default: 80% of the machine's memory]
+    #[arg(long, value_name = "MiB")]
+    pub target_mib: Option<u32>,
+
+    /// Seconds to wait for the guest to reach the target before deflating
+    #[arg(long, value_name = "SECONDS", default_value_t = 30)]
+    pub wait: u64,
+
+    /// Seconds to wait after deflating before sampling host memory again, so
+    /// free-page reporting can return the evicted pages
+    #[arg(long, value_name = "SECONDS", default_value_t = 2)]
+    pub settle: u64,
+
+    /// Output in JSON format
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl ReclaimCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let label = vm_common::vm_label(&self.name);
+        let config = smolvm::config::SmolvmConfig::load()?;
+        let record = config
+            .list_vms()
+            .find(|(name, _)| *name == &label)
+            .map(|(_, record)| record.clone())
+            .ok_or_else(|| {
+                smolvm::Error::config("machine reclaim", format!("machine '{label}' not found"))
+            })?;
+        if record.state != smolvm::config::RecordState::Running {
+            return Err(smolvm::Error::config(
+                "machine reclaim",
+                format!("machine '{label}' is not running"),
+            ));
+        }
+        if record.forkable_on_start() {
+            return Err(smolvm::Error::config(
+                "machine reclaim",
+                format!(
+                    "machine '{label}' is a branch source; its RAM is the image its branches share, so it is not reclaimed"
+                ),
+            ));
+        }
+        let target_mib = self.target_mib.unwrap_or(record.mem / 10 * 8);
+        if target_mib == 0 || target_mib >= record.mem {
+            return Err(smolvm::Error::config(
+                "machine reclaim",
+                format!(
+                    "--target-mib must be between 1 and {} (the machine's memory minus one)",
+                    record.mem.saturating_sub(1)
+                ),
+            ));
+        }
+        let host_rss = || {
+            record
+                .pid
+                .and_then(|pid| smolvm::process::process_stats(pid as smolvm::process::Pid))
+                .map(|stats| stats.rss_bytes)
+        };
+        let before = host_rss();
+        let socket = smolvm::agent::fork::control_socket_path(&label);
+        let interval = Duration::from_millis(500);
+        let polls = u32::try_from(self.wait.saturating_mul(2)).unwrap_or(u32::MAX);
+        let pulse = smolvm::agent::fork::pulse_balloon(&socket, target_mib, polls, interval)?;
+        std::thread::sleep(Duration::from_secs(self.settle));
+        let after = host_rss();
+        let reclaimed = before.zip(after).map(|(b, a)| b.saturating_sub(a));
+        if self.json {
+            let json = serde_json::json!({
+                "name": label,
+                "target_mib": target_mib,
+                "reached": pulse.reached,
+                "deflated": pulse.deflated,
+                "host_rss_before_bytes": before,
+                "host_rss_after_bytes": after,
+                "reclaimed_bytes": reclaimed,
+            });
+            println!("{json}");
+        } else {
+            let mib = |bytes: Option<u64>| {
+                bytes.map_or_else(|| "?".to_string(), |b| format!("{}", b / (1024 * 1024)))
+            };
+            println!(
+                "Reclaimed {} MiB from '{label}' (host RSS {} -> {} MiB; balloon {} MiB, target {})",
+                mib(reclaimed),
+                mib(before),
+                mib(after),
+                target_mib,
+                if pulse.reached { "reached" } else { "not reached" },
+            );
+        }
+        if !pulse.deflated {
+            return Err(smolvm::Error::agent(
+                "machine reclaim",
+                "the balloon did not deflate; the guest keeps a reduced ceiling until it does",
+            ));
+        }
         Ok(())
     }
 }

@@ -353,6 +353,77 @@ pub fn control_socket_cmd_with_timeout(
     Ok(reply)
 }
 
+/// Outcome of one balloon pulse ([`pulse_balloon`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BalloonPulse {
+    /// The guest reported the inflate target before the wait ran out.
+    pub reached: bool,
+    /// The balloon is back at zero, so the guest keeps its full memory ceiling.
+    pub deflated: bool,
+}
+
+/// Inflate a running machine's balloon to `target_mib`, wait for the guest to
+/// reach it, then deflate to zero.
+///
+/// Inflating makes the guest drop page cache and free pages, which free-page
+/// reporting hands back to the host; deflating restores the guest's ceiling.
+/// The durable effect is the eviction, not the balloon. Polls `polls` times,
+/// `interval` apart. Fails only when the guest refuses the inflate, in which
+/// case nothing changed.
+pub fn pulse_balloon(
+    sock: &Path,
+    target_mib: u32,
+    polls: u32,
+    interval: Duration,
+) -> Result<BalloonPulse> {
+    pulse_balloon_with(
+        |command| control_socket_cmd(sock, command),
+        std::thread::sleep,
+        target_mib,
+        polls,
+        interval,
+    )
+}
+
+fn pulse_balloon_with(
+    mut cmd: impl FnMut(&str) -> Result<String>,
+    mut sleep: impl FnMut(Duration),
+    target_mib: u32,
+    polls: u32,
+    interval: Duration,
+) -> Result<BalloonPulse> {
+    let inflate = cmd(&format!("BALLOON {target_mib}"))?;
+    if !inflate.starts_with("OK") {
+        return Err(Error::agent("balloon inflate", inflate));
+    }
+    let mut reached = false;
+    for _ in 0..polls {
+        sleep(interval);
+        match cmd("BALLOON") {
+            Ok(reply) if reply.contains(&format!("actual={target_mib}")) => {
+                reached = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    let mut deflated = false;
+    for _ in 0..3 {
+        match cmd("BALLOON 0") {
+            Ok(reply) if reply.starts_with("OK") => {
+                deflated = true;
+                break;
+            }
+            reply => {
+                tracing::warn!(reply = ?reply, "balloon deflate refused");
+                sleep(Duration::from_secs(1));
+            }
+        }
+    }
+    Ok(BalloonPulse { reached, deflated })
+}
+
 /// Workload preparation choices inherited by every clone of one golden.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ForkpointProfile {
@@ -5175,5 +5246,81 @@ mod tests {
             false,
             true
         ));
+    }
+}
+
+#[cfg(test)]
+mod balloon_pulse_tests {
+    use super::{pulse_balloon_with, BalloonPulse};
+    use crate::{Error, Result};
+    use std::time::Duration;
+
+    fn run(replies: Vec<Result<String>>) -> (Result<BalloonPulse>, Vec<String>) {
+        let mut replies = replies.into_iter();
+        let mut sent = Vec::new();
+        let result = pulse_balloon_with(
+            |command| {
+                sent.push(command.to_string());
+                replies.next().unwrap_or_else(|| Ok("OK".into()))
+            },
+            |_| {},
+            800,
+            3,
+            Duration::ZERO,
+        );
+        (result, sent)
+    }
+
+    #[test]
+    fn inflates_waits_for_the_target_then_deflates() {
+        let (result, sent) = run(vec![
+            Ok("OK balloon target 800 MiB".into()),
+            Ok("OK target=800 actual=400".into()),
+            Ok("OK target=800 actual=800".into()),
+            Ok("OK balloon target 0 MiB".into()),
+        ]);
+        assert_eq!(
+            result.unwrap(),
+            BalloonPulse {
+                reached: true,
+                deflated: true
+            }
+        );
+        assert_eq!(sent, ["BALLOON 800", "BALLOON", "BALLOON", "BALLOON 0"]);
+    }
+
+    #[test]
+    fn a_refused_inflate_changes_nothing() {
+        let (result, sent) = run(vec![Ok("ERR no balloon".into())]);
+        assert!(result.is_err());
+        assert_eq!(sent, ["BALLOON 800"]);
+    }
+
+    #[test]
+    fn deflates_even_when_the_target_is_never_reached() {
+        let (result, sent) = run(vec![
+            Ok("OK".into()),
+            Ok("OK target=800 actual=100".into()),
+            Err(Error::agent("read control socket", "closed")),
+            Ok("ERR busy".into()),
+            Ok("OK balloon target 0 MiB".into()),
+        ]);
+        assert_eq!(
+            result.unwrap(),
+            BalloonPulse {
+                reached: false,
+                deflated: true
+            }
+        );
+        assert_eq!(
+            sent,
+            [
+                "BALLOON 800",
+                "BALLOON",
+                "BALLOON",
+                "BALLOON 0",
+                "BALLOON 0"
+            ]
+        );
     }
 }
