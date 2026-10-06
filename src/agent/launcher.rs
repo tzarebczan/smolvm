@@ -2796,6 +2796,7 @@ fn spawn_idle_reclaim(ctl: PathBuf, memory_mib: u32, idle_minutes: u64) {
                     target_mib,
                     30,
                     Duration::from_secs(2),
+                    &|| false,
                 ) {
                     Ok(pulse) => pulse,
                     Err(error) => {

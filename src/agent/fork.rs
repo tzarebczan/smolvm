@@ -368,13 +368,17 @@ pub struct BalloonPulse {
 /// Inflating makes the guest drop page cache and free pages, which free-page
 /// reporting hands back to the host; deflating restores the guest's ceiling.
 /// The durable effect is the eviction, not the balloon. Polls `polls` times,
-/// `interval` apart. Fails only when the guest refuses the inflate, in which
-/// case nothing changed.
+/// `interval` apart, and stops polling early once `cancelled` returns true,
+/// so an interrupted caller still deflates. Fails when the guest refuses the
+/// inflate (nothing changed). When the inflate's reply is lost, the inflate
+/// may have been applied, so the balloon is deflated before the error is
+/// returned.
 pub fn pulse_balloon(
     sock: &Path,
     target_mib: u32,
     polls: u32,
     interval: Duration,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<BalloonPulse> {
     pulse_balloon_with(
         |command| control_socket_cmd(sock, command),
@@ -382,6 +386,7 @@ pub fn pulse_balloon(
         target_mib,
         polls,
         interval,
+        cancelled,
     )
 }
 
@@ -391,13 +396,21 @@ fn pulse_balloon_with(
     target_mib: u32,
     polls: u32,
     interval: Duration,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<BalloonPulse> {
-    let inflate = cmd(&format!("BALLOON {target_mib}"))?;
-    if !inflate.starts_with("OK") {
-        return Err(Error::agent("balloon inflate", inflate));
+    match cmd(&format!("BALLOON {target_mib}")) {
+        Ok(reply) if reply.starts_with("OK") => {}
+        Ok(reply) => return Err(Error::agent("balloon inflate", reply)),
+        Err(error) => {
+            deflate_balloon(&mut cmd, &mut sleep);
+            return Err(error);
+        }
     }
     let mut reached = false;
     for _ in 0..polls {
+        if cancelled() {
+            break;
+        }
         sleep(interval);
         match cmd("BALLOON") {
             Ok(reply) if reply.contains(&format!("actual={target_mib}")) => {
@@ -408,20 +421,25 @@ fn pulse_balloon_with(
             Err(_) => break,
         }
     }
-    let mut deflated = false;
+    let deflated = deflate_balloon(&mut cmd, &mut sleep);
+    Ok(BalloonPulse { reached, deflated })
+}
+
+/// Return the balloon to zero, retrying a refused request up to three times.
+fn deflate_balloon(
+    cmd: &mut impl FnMut(&str) -> Result<String>,
+    sleep: &mut impl FnMut(Duration),
+) -> bool {
     for _ in 0..3 {
         match cmd("BALLOON 0") {
-            Ok(reply) if reply.starts_with("OK") => {
-                deflated = true;
-                break;
-            }
+            Ok(reply) if reply.starts_with("OK") => return true,
             reply => {
                 tracing::warn!(reply = ?reply, "balloon deflate refused");
                 sleep(Duration::from_secs(1));
             }
         }
     }
-    Ok(BalloonPulse { reached, deflated })
+    false
 }
 
 /// Workload preparation choices inherited by every clone of one golden.
@@ -5256,6 +5274,10 @@ mod balloon_pulse_tests {
     use std::time::Duration;
 
     fn run(replies: Vec<Result<String>>) -> (Result<BalloonPulse>, Vec<String>) {
+        run_with(replies, false)
+    }
+
+    fn run_with(replies: Vec<Result<String>>, cancel: bool) -> (Result<BalloonPulse>, Vec<String>) {
         let mut replies = replies.into_iter();
         let mut sent = Vec::new();
         let result = pulse_balloon_with(
@@ -5267,6 +5289,7 @@ mod balloon_pulse_tests {
             800,
             3,
             Duration::ZERO,
+            &|| cancel,
         );
         (result, sent)
     }
@@ -5322,5 +5345,25 @@ mod balloon_pulse_tests {
                 "BALLOON 0"
             ]
         );
+    }
+
+    #[test]
+    fn a_lost_inflate_reply_still_deflates() {
+        let (result, sent) = run(vec![Err(Error::agent("read control socket", "timed out"))]);
+        assert!(result.is_err());
+        assert_eq!(sent, ["BALLOON 800", "BALLOON 0"]);
+    }
+
+    #[test]
+    fn cancellation_skips_the_wait_and_deflates() {
+        let (result, sent) = run_with(vec![Ok("OK".into())], true);
+        assert_eq!(
+            result.unwrap(),
+            BalloonPulse {
+                reached: false,
+                deflated: true
+            }
+        );
+        assert_eq!(sent, ["BALLOON 800", "BALLOON 0"]);
     }
 }

@@ -5464,7 +5464,23 @@ impl ReclaimCmd {
         let socket = smolvm::agent::fork::control_socket_path(&label);
         let interval = Duration::from_millis(500);
         let polls = u32::try_from(self.wait.saturating_mul(2)).unwrap_or(u32::MAX);
-        let pulse = smolvm::agent::fork::pulse_balloon(&socket, target_mib, polls, interval)?;
+        // Ctrl+C or SIGTERM ends the wait early but still deflates: exiting
+        // mid-pulse would leave the guest with a reduced ceiling.
+        let _cancel = ReclaimCancelGuard::install();
+        let pulse =
+            smolvm::agent::fork::pulse_balloon(&socket, target_mib, polls, interval, &|| {
+                RECLAIM_CANCELLED.load(std::sync::atomic::Ordering::SeqCst)
+            })?;
+        if RECLAIM_CANCELLED.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(smolvm::Error::agent(
+                "machine reclaim",
+                if pulse.deflated {
+                    "interrupted; the balloon was deflated"
+                } else {
+                    "interrupted, and the balloon did not deflate"
+                },
+            ));
+        }
         std::thread::sleep(Duration::from_secs(self.settle));
         let after = host_rss();
         let reclaimed = before.zip(after).map(|(b, a)| b.saturating_sub(a));
@@ -5499,6 +5515,42 @@ impl ReclaimCmd {
             ));
         }
         Ok(())
+    }
+}
+
+/// Set by the reclaim signal handler; read by the balloon pulse.
+static RECLAIM_CANCELLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// SIGINT/SIGTERM handler for `machine reclaim`: only stores a flag, which is
+/// async-signal-safe.
+#[cfg(unix)]
+extern "C" fn reclaim_cancel_handler(_sig: libc::c_int) {
+    RECLAIM_CANCELLED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Routes SIGINT and SIGTERM to [`RECLAIM_CANCELLED`] while a pulse runs and
+/// restores the default dispositions afterwards.
+struct ReclaimCancelGuard(());
+
+impl ReclaimCancelGuard {
+    fn install() -> Self {
+        #[cfg(unix)]
+        unsafe {
+            let handler = reclaim_cancel_handler as *const () as libc::sighandler_t;
+            libc::signal(libc::SIGINT, handler);
+            libc::signal(libc::SIGTERM, handler);
+        }
+        Self(())
+    }
+}
+
+impl Drop for ReclaimCancelGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
+        }
     }
 }
 
