@@ -2764,7 +2764,6 @@ fn spawn_idle_reclaim(ctl: PathBuf, memory_mib: u32, idle_minutes: u64) {
     let _ = std::thread::Builder::new()
         .name("idle-reclaim".into())
         .spawn(move || {
-            let cmd = |c: &str| crate::agent::fork::control_socket_cmd(&ctl, c);
             let mut idle_ticks = 0u32;
             let mut armed = true;
             let mut reclaimed_rss = None;
@@ -2790,37 +2789,24 @@ fn spawn_idle_reclaim(ctl: PathBuf, memory_mib: u32, idle_minutes: u64) {
                     continue;
                 }
                 tracing::info!(target_mib, "idle reclaim: balloon pulse");
-                let inflate = cmd(&format!("BALLOON {target_mib}"));
-                if !inflate.as_ref().is_ok_and(|reply| reply.starts_with("OK")) {
-                    tracing::warn!(reply = ?inflate, "idle reclaim: balloon inflate refused");
-                    continue;
-                }
-                armed = false;
-                idle_ticks = 0;
                 // Wait for the guest to reach the target (or give up), then
                 // deflate; the durable effect is the cache eviction.
-                for _ in 0..30 {
-                    std::thread::sleep(Duration::from_secs(2));
-                    match cmd("BALLOON") {
-                        Ok(r) if r.contains(&format!("actual={target_mib}")) => break,
-                        Ok(_) => {}
-                        Err(_) => break,
+                let pulse = match crate::agent::fork::pulse_balloon(
+                    &ctl,
+                    target_mib,
+                    30,
+                    Duration::from_secs(2),
+                    &|| false,
+                ) {
+                    Ok(pulse) => pulse,
+                    Err(error) => {
+                        tracing::warn!(%error, "idle reclaim: balloon inflate refused");
+                        continue;
                     }
-                }
-                let mut deflated = false;
-                for _ in 0..3 {
-                    match cmd("BALLOON 0") {
-                        Ok(reply) if reply.starts_with("OK") => {
-                            deflated = true;
-                            break;
-                        }
-                        reply => {
-                            tracing::warn!(reply = ?reply, "idle reclaim: balloon deflate refused");
-                            std::thread::sleep(Duration::from_secs(1));
-                        }
-                    }
-                }
-                if !deflated {
+                };
+                armed = false;
+                idle_ticks = 0;
+                if !pulse.deflated {
                     // The negotiated DEFLATE_ON_OOM feature keeps the guest
                     // usable, but retain the warning so a broken control path
                     // is observable instead of silently reducing its ceiling.

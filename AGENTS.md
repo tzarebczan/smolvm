@@ -114,6 +114,7 @@ smolvm machine update --name NAME [OPTIONS]              # modify stopped machin
 smolvm machine cp SRC DST                         # copy files (host↔VM)
 smolvm machine exec --stream --name NAME -- CMD   # streaming output
 smolvm machine monitor [--name NAME]              # foreground health + restart
+smolvm machine reclaim [--name NAME]              # balloon pulse: hand idle RAM back now
 
 smolvm pack create --image IMAGE -o PATH          # package
 smolvm pack create --from-vm NAME -o PATH         # pack from VM snapshot
@@ -651,6 +652,8 @@ OpenAPI spec: `smolvm serve openapi`
 
 ## Important Behaviors
 
+- **`machine status --json` reports guest memory.** For a running machine it adds a `memory` object (`total_bytes`, `available_bytes`, `used_bytes`, `free_bytes`, `cached_bytes`, swap) read from the guest, the same figures the text status prints.
+- **`machine reclaim` returns idle memory on demand.** It runs the idle-reclaim balloon pulse now (inflate to 80% of the machine's memory by default, wait, deflate) and reports the host RSS before and after. Branch sources are refused, as idle reclaim skips them.
 - **Observational commands don't stop running VMs.** `machine images`, `machine status`, `machine ls` and similar read-only commands leave a running VM in its current state. If the VM was already running before the command, it stays running after.
 - **`machine prune` works on a running VM.** Regular prune only removes unreferenced layers and is safe while containers are active. `prune --all` requires the VM to be stopped first since it deletes manifests for layers that may be in use.
 - **`machine exec` persists filesystem changes.** Package installs, config edits, and file writes inside `exec` survive across sessions. This works for both bare VMs and image-based VMs (created with `--image`).
