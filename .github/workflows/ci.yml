@@ -1,9 +1,8 @@
 name: CI
 
-# PR-only (no push-to-main duplicate). Linux jobs run on the self-hosted
-# runner (repo var RUNNER_SELF, default `t16`) inside an Ubuntu container; the billed macOS (10x),
-# Windows (2x) and arm64 legs run only on dispatch and release
-# (workflow_call), never on pull requests.
+# PR-only (no push-to-main duplicate) plus manual dispatch and release
+# (workflow_call). The repo is public, so GitHub-hosted minutes are free and
+# every leg (Linux x86_64/arm64, macOS, Windows) runs on pull requests.
 on:
   pull_request:
     branches: [main]
@@ -23,9 +22,7 @@ jobs:
   # ==========================================================================
   fmt:
     name: Format
-    runs-on: ${{ vars.RUNNER_SELF || 't16' }}
-    container:
-      image: ghcr.io/catthehacker/ubuntu:act-24.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -33,33 +30,17 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-      # Container steps run as root; hand the bind-mounted work dir back to
-      # the runner's user so the host runner can clean it next time.
-      - name: Return workspace ownership to the runner user
-        if: always()
-        run: chown -R "$(stat -c %u:%g /__w)" /__w/ 2>/dev/null || true
-
   secrets-guards:
     name: Secrets invariants
-    runs-on: ${{ vars.RUNNER_SELF || 't16' }}
-    container:
-      image: ghcr.io/catthehacker/ubuntu:act-24.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Check secrets guardrails
         run: ./scripts/check-secrets-guards.sh
 
-      # Container steps run as root; hand the bind-mounted work dir back to
-      # the runner's user so the host runner can clean it next time.
-      - name: Return workspace ownership to the runner user
-        if: always()
-        run: chown -R "$(stat -c %u:%g /__w)" /__w/ 2>/dev/null || true
-
   libkrun-provenance:
     name: libkrun freshness
-    runs-on: ${{ vars.RUNNER_SELF || 't16' }}
-    container:
-      image: ghcr.io/catthehacker/ubuntu:act-24.04
+    runs-on: ubuntu-latest
     steps:
       # LFS on: check-krun-exports.sh reads the actual bundled lib binaries.
       # (check-libkrun-provenance.sh itself only needs the pinned gitlinks.)
@@ -86,17 +67,9 @@ jobs:
       - name: Bundled libkrun embeds a static guest init
         run: python3 ./scripts/check-krun-init-static.py
 
-      # Container steps run as root; hand the bind-mounted work dir back to
-      # the runner's user so the host runner can clean it next time.
-      - name: Return workspace ownership to the runner user
-        if: always()
-        run: chown -R "$(stat -c %u:%g /__w)" /__w/ 2>/dev/null || true
-
   audit:
     name: Cargo Audit
-    runs-on: ${{ vars.RUNNER_SELF || 't16' }}
-    container:
-      image: ghcr.io/catthehacker/ubuntu:act-24.04
+    runs-on: ubuntu-latest
     # Scans Cargo.lock for RustSec advisories — no engine/libkrun needed. Honors
     # .cargo/audit.toml, which ignores documented unmaintained-transitive notices
     # so a real vulnerability stands out instead of hiding in warning noise.
@@ -106,18 +79,11 @@ jobs:
       - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit
 
-      # Container steps run as root; hand the bind-mounted work dir back to
-      # the runner's user so the host runner can clean it next time.
-      - name: Return workspace ownership to the runner user
-        if: always()
-        run: chown -R "$(stat -c %u:%g /__w)" /__w/ 2>/dev/null || true
-
   # ==========================================================================
   # macOS Build & Test (Apple Silicon)
   # ==========================================================================
   macos:
     name: macOS (arm64)
-    if: github.event_name != 'pull_request'
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v6
@@ -202,14 +168,17 @@ jobs:
   # ==========================================================================
   linux:
     name: Linux (${{ matrix.arch }})
-    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || (vars.RUNNER_SELF || 't16') }}
-    container: ${{ matrix.container }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        # x86_64 self-hosted (Ubuntu container) always; the billed arm64 leg
-        # (GitHub-hosted, no container) only on dispatch/release.
-        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"arch":"x86_64","container":"ghcr.io/catthehacker/ubuntu:act-24.04","target":"x86_64-unknown-linux-gnu"}]' || '[{"arch":"x86_64","container":"ghcr.io/catthehacker/ubuntu:act-24.04","target":"x86_64-unknown-linux-gnu"},{"arch":"aarch64","container":"","target":"aarch64-unknown-linux-gnu"}]') }}
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
 
     steps:
       - uses: actions/checkout@v6
@@ -315,20 +284,12 @@ jobs:
       # Note: Full VM integration tests (and critest CRI conformance) require
       # KVM + real libkrun. Run those locally on a machine with KVM access.
 
-      # Container steps run as root; hand the bind-mounted work dir back to
-      # the runner's user so the host runner can clean it next time.
-      - name: Return workspace ownership to the runner user
-        if: always()
-        run: chown -R "$(stat -c %u:%g /__w)" /__w/ 2>/dev/null || true
-
   # ==========================================================================
   # Windows Build & Lint (cross-compiled from Linux, mingw-w64 / GNU target)
   # ==========================================================================
   windows:
     name: Windows (x86_64, cross)
-    runs-on: ${{ vars.RUNNER_SELF || 't16' }}
-    container:
-      image: ghcr.io/catthehacker/ubuntu:act-24.04
+    runs-on: ubuntu-latest
     env:
       CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
     steps:
@@ -367,12 +328,6 @@ jobs:
       - name: Clippy
         run: cargo clippy --release --target x86_64-pc-windows-gnu --all-targets -- -D warnings
 
-      # Container steps run as root; hand the bind-mounted work dir back to
-      # the runner's user so the host runner can clean it next time.
-      - name: Return workspace ownership to the runner user
-        if: always()
-        run: chown -R "$(stat -c %u:%g /__w)" /__w/ 2>/dev/null || true
-
   # ==========================================================================
   # Windows native unit tests (real NTFS, not cross-compiled)
   # ==========================================================================
@@ -383,7 +338,6 @@ jobs:
   # real Windows runner so that class of regression is caught in CI.
   windows-native-test:
     name: Windows (x86_64, native tests)
-    if: github.event_name != 'pull_request'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -409,9 +363,7 @@ jobs:
   # ==========================================================================
   agent:
     name: Agent (Linux musl)
-    runs-on: ${{ vars.RUNNER_SELF || 't16' }}
-    container:
-      image: ghcr.io/catthehacker/ubuntu:act-24.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
@@ -467,12 +419,6 @@ jobs:
       - name: Guest CUDA shim application ABI
         run: scripts/check-cuda-shim-exports.sh
 
-      # Container steps run as root; hand the bind-mounted work dir back to
-      # the runner's user so the host runner can clean it next time.
-      - name: Return workspace ownership to the runner user
-        if: always()
-        run: chown -R "$(stat -c %u:%g /__w)" /__w/ 2>/dev/null || true
-
   # ==========================================================================
   # Downstream compatibility: the smol CLI builds this workspace via path deps
   # (`smolvm = { path = ".." }`) and releases in version lockstep, so an engine
@@ -482,9 +428,7 @@ jobs:
   # ==========================================================================
   smol-compat:
     name: smol CLI compatibility
-    runs-on: ${{ vars.RUNNER_SELF || 't16' }}
-    container:
-      image: ghcr.io/catthehacker/ubuntu:act-24.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
@@ -550,28 +494,19 @@ jobs:
           LIBRARY_PATH: /usr/local/lib
           LIBKRUN_BUNDLE: /usr/local/lib
 
-      # Container steps run as root; hand the bind-mounted work dir back to
-      # the runner's user so the host runner can clean it next time.
-      - name: Return workspace ownership to the runner user
-        if: always()
-        run: chown -R "$(stat -c %u:%g /__w)" /__w/ 2>/dev/null || true
-
   # ==========================================================================
   # Summary job for branch protection
   # ==========================================================================
   ci-success:
     name: CI Success
     needs: [fmt, macos, linux, windows, agent, smol-compat]
-    runs-on: ${{ vars.RUNNER_SELF || 't16' }}
+    runs-on: ubuntu-latest
     if: always()
     steps:
       - name: Check all jobs passed
         run: |
-          # macOS is skipped on pull requests (dispatch/release only).
-          macos="${{ needs.macos.result }}"
-          if [[ "${{ github.event_name }}" == "pull_request" && "$macos" == "skipped" ]]; then macos=success; fi
           if [[ "${{ needs.fmt.result }}" != "success" ]] || \
-             [[ "$macos" != "success" ]] || \
+             [[ "${{ needs.macos.result }}" != "success" ]] || \
              [[ "${{ needs.linux.result }}" != "success" ]] || \
              [[ "${{ needs.windows.result }}" != "success" ]] || \
              [[ "${{ needs.agent.result }}" != "success" ]] || \
