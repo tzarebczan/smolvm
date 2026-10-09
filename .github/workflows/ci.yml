@@ -1,11 +1,17 @@
 name: CI
 
+# PR-only (no push-to-main duplicate) plus manual dispatch and release
+# (workflow_call). The repo is public, so GitHub-hosted minutes are free and
+# every leg (Linux x86_64/arm64, macOS, Windows) runs on pull requests.
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
   workflow_call:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
